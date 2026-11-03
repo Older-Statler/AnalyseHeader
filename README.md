@@ -97,7 +97,11 @@ Email clients change their menus often, so these steps may not match your versio
 - **Apple Mail:** choose **View > Message > All Headers** or **View > Message > Raw Source**.
 - **Thunderbird:** choose **View > Message Source** (Ctrl+U / Cmd+U).
 
-You can paste the full message source instead of just the headers. Parsing stops at the first blank line, where the body begins. Only ordinary line breaks split headers. A header line that contains a Unicode line or paragraph separator (U+2028, U+2029) is kept whole.
+You can paste the full message source instead of just the headers. Parsing stops at the first blank line, where the body begins. A line counts as blank if it contains only whitespace: spaces, tabs, non-breaking spaces, vertical tabs, form feeds and similar characters. This covers webmail copies that turn the blank line into non-breaking spaces.
+
+Unicode line and paragraph separators (U+2028, U+2029) are handled differently:
+- A line containing only one of them doesn't count as blank.
+- They don't split headers either; only ordinary line breaks do. A header line that contains one is kept whole.
 
 ## Limitations
 

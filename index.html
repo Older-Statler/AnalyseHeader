@@ -5,7 +5,7 @@
 <!-- CSP: the script-src hash must be regenerated whenever the inline script changes. From this folder run:
      node -e 'const h=require("fs").readFileSync("index.html","utf8"),t="script>";console.log("sha256-"+require("crypto").createHash("sha256").update(h.slice(h.lastIndexOf("<"+t)+t.length+1,h.lastIndexOf("</"+t))).digest("base64"))' -->
 <!-- If this page is ever hosted, also send CSP "frame-ancestors 'none'" as an HTTP header: a meta CSP cannot set it. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Q5Z47w+nXgDGk+S3CxkrBO91wSSYO03Qk6fimKZR0Wc='; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-c6tzzJgWHjoSkGdV2QJHj2bpKJcD8et6Wwt0Os/mZoQ='; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Email Header Analyser</title>
 <meta name="description" content="Paste raw email headers to check SPF, DKIM, DMARC, spam verdicts and trace the mail flow. Runs entirely in your browser.">
@@ -311,8 +311,9 @@ function parseHeaders(raw) {
   const out = [];
   for (const line of lines) {
     // The first blank line after the headers ends the header block; anything below is body content.
-    // Only spaces/tabs count as blank: trim() would also treat a lone U+2028/U+2029 as blank and end the headers early.
-    if (/^[ \t]*$/.test(line)) { if (out.length) break; continue; }
+    // Any whitespace-only line is blank (including NBSP, VT, FF, U+3000 from a webmail "show original" copy), except
+    // U+2028/U+2029: trim() would treat a lone line separator as blank and let a sender end the headers early.
+    if (/^[^\S\u2028\u2029]*$/u.test(line)) { if (out.length) break; continue; }
     if (/^[ \t]/.test(line) && out.length) { out[out.length - 1].value += " " + line.trim(); continue; }
     const m = line.match(HEADER_LINE);
     if (m) out.push({ name: m[1], value: m[2].trim() });
