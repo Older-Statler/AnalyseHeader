@@ -5,7 +5,7 @@
 <!-- CSP: the script-src hash must be regenerated whenever the inline script changes. From this folder run:
      node -e 'const h=require("fs").readFileSync("index.html","utf8"),t="script>";console.log("sha256-"+require("crypto").createHash("sha256").update(h.slice(h.lastIndexOf("<"+t)+t.length+1,h.lastIndexOf("</"+t))).digest("base64"))' -->
 <!-- If this page is ever hosted, also send CSP "frame-ancestors 'none'" as an HTTP header: a meta CSP cannot set it. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-lbAhhKVZHfOo/MglRHKuvYvX5JeWcY3t6RCm9fv4+to='; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-WZWahV7ePFIRWOMB9jbXrBJldNdQRoJWcq6nRb4bdwI='; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Email Header Analyser</title>
 <meta name="description" content="Paste raw email headers to check SPF, DKIM, DMARC, spam verdicts and trace the mail flow. Runs entirely in your browser.">
@@ -375,7 +375,9 @@ function parseAddr(v) {
   const comments = rawComments.map((c) => decodeWords(c.trim()));
   const name = rawName ? decodeWords(rawName).replace(/^"(.*)"$/, "$1").trim() : (comments[0] || "");
   // Ambiguous: several angle-addrs, unbalanced quoting, or an "@" outside both the address and the display name.
-  const ambiguous = (v.split("<").length - 1) > 1 || unbalanced || countAt(v) > countAt(email) + countAt(rawName);
+  // Counted after NFKC so full-width look-alikes (＜ ＠) count as the real characters.
+  const nf = (t) => t.normalize("NFKC");
+  const ambiguous = (nf(v).split("<").length - 1) > 1 || unbalanced || countAt(nf(v)) > countAt(nf(email)) + countAt(nf(rawName));
   const domain = (email.split("@")[1] || "").toLowerCase().replace(/[>\s].*$/, "").replace(/\.$/, "");
   return { name, email, domain, raw: v, rawName, comments, ambiguous };
 }
@@ -588,11 +590,15 @@ function analyse(raw) {
     arList.push(h.truncated ? { idx, authserv: "", results: [], tooLong: true } : { idx, ...parseAuthResults(h.value) });
   });
   const servId = (ar) => (ar.authserv.split(/\s+/)[0] || "").toLowerCase();
-  const firstRcv = headers.findIndex((h) => h.name.toLowerCase() === "received");
+  // Received and X-Received both mark a hop added by a receiving server.
+  const isHop = (h) => /^(x-)?received$/i.test(h.name);
+  const firstRcv = headers.findIndex(isHop);
   const arBlock = arList.slice(0, 1);
   for (const ar of arList.slice(1)) if (firstRcv >= 0 && ar.idx < firstRcv && servId(ar) === servId(arList[0])) arBlock.push(ar);
   const arIgnored = arList.filter((ar) => !arBlock.includes(ar));
   const topAR = arBlock.length > 0;
+  // With no receiving-server hop at all, the topmost A-R can't be attributed to the user's mail provider.
+  const authTrusted = topAR && firstRcv >= 0;
 
   const arcSeals = all("arc-seal").map(parseTags);
   const arcList = all("arc-authentication-results").map((v) => {
@@ -644,7 +650,9 @@ function analyse(raw) {
   const add = (sev, title, detail, weight) => checks.push({ sev, title, detail, weight: weight ?? (sev === "bad" ? 25 : sev === "warn" ? 8 : 0) });
   // Results not from the receiver's own top-level Authentication-Results get no "good" credit.
   const vouch = (sev, trusted) => (sev === "good" && !trusted ? "info" : sev);
-  const UNVERIFIED = " Unverified: there is no top-level Authentication-Results header from the receiving server, so this result could have been added by the sender.";
+  const UNVERIFIED = topAR
+    ? " Unverified: no receiving server hop (Received header) was found, so these results can’t be attributed to your mail provider and could have been added by the sender."
+    : " Unverified: there is no top-level Authentication-Results header from the receiving server, so this result could have been added by the sender.";
 
   if (inputTruncated || valuesTruncated) add("warn", "Input truncated", (inputTruncated ? `Only the first ${MAX_INPUT / 1024} KB of the pasted text was analysed. ` : "") +
     (valuesTruncated ? `${valuesTruncated} header value(s) longer than ${MAX_VALUE / 1024} KB were cut short. ` : "") + "Results may be incomplete.");
@@ -655,6 +663,7 @@ function analyse(raw) {
   if (!topAR) add("warn", "No Authentication-Results header", authSource === "none found"
     ? "No receiving server recorded authentication results."
     : `Results below come from ${authSource}, which the sender could have added themselves. They are shown for reference only and are not treated as passes.`, 0);
+  else if (!authTrusted) add("warn", "Authentication results not attributable", "No receiving server hop (Received or X-Received header) was found, so these results can’t be attributed to your mail provider. They may have been supplied by the sender and are not treated as passes.", 0);
   if (arIgnored.length) {
     const topId = servId(arBlock[0]);
     const reused = arIgnored.filter((x) => servId(x) === topId);
@@ -679,7 +688,7 @@ function analyse(raw) {
 
   // SPF
   const spf = auth.spf && auth.spf[0];
-  const spfTrusted = topAR && !!spf && !spf.viaReceivedSpf;
+  const spfTrusted = authTrusted && !!spf && !spf.viaReceivedSpf;
   const spfDomain = spf ? domainFrom(spf.props["smtp.mailfrom"] || spf.props["envelope-from"] || spf.props["smtp.helo"] || "") || (returnPath && returnPath.domain) : returnPath && returnPath.domain;
   const spfIP = spf ? (spf.props["client-ip"] || (spf.comments.join(" ").match(/(?:sender IP is|designates|discourages use of|does not designate)\s+([0-9a-f:.]+)/i) || [])[1] || "") : "";
   if (!spf) add("warn", "No SPF result found", "No receiving server recorded an SPF check. The headers may be incomplete or copied from the sending side.");
@@ -699,7 +708,7 @@ function analyse(raw) {
     const best = dkimRes.find((r) => r.result === "pass") || dkimRes[0];
     const c = resClass(best.result);
     const doms = dkimRes.map((r) => { const d = dkimDom(r); return d ? `${d}: ${r.result}` : (r.comments[0] || r.result); }).join(", ");
-    add(vouch(c, topAR), `DKIM ${best.result}${topAR || c !== "good" ? "" : " — unverified"}`, `Signature results — ${doms}.` + (topAR || c !== "good" ? "" : UNVERIFIED), c === "bad" ? 20 : c === "warn" ? 10 : 0);
+    add(vouch(c, authTrusted), `DKIM ${best.result}${authTrusted || c !== "good" ? "" : " — unverified"}`, `Signature results — ${doms}.` + (authTrusted || c !== "good" ? "" : UNVERIFIED), c === "bad" ? 20 : c === "warn" ? 10 : 0);
   }
   dkimSigs.forEach((s) => {
     if (/sha1/i.test(s.a || "")) add("warn", "Weak DKIM algorithm", `Signature from ${s.d} uses ${s.a}. SHA-1 is deprecated; rsa-sha256 or ed25519-sha256 is expected.`);
@@ -713,8 +722,8 @@ function analyse(raw) {
     const pc = dmarc.comments.join(" ").match(/\bp=([a-z]+)/i);
     dmarcPolicy = (pc && pc[1].toLowerCase()) || (dmarc.props.action || "").toLowerCase();
     const c = resClass(dmarc.result);
-    add(vouch(c, topAR), `DMARC ${dmarc.result}${topAR || c !== "good" ? "" : " — unverified"}`, `Header From domain ${dmarc.props["header.from"] || (from && from.domain) || "?"}${dmarcPolicy ? `, policy/action: ${dmarcPolicy}` : ""}.` +
-      (c === "bad" ? " The visible sender domain was not authenticated — a strong sign of spoofing." : "") + (topAR || c !== "good" ? "" : UNVERIFIED), c === "bad" ? 35 : c === "warn" ? 10 : 0);
+    add(vouch(c, authTrusted), `DMARC ${dmarc.result}${authTrusted || c !== "good" ? "" : " — unverified"}`, `Header From domain ${dmarc.props["header.from"] || (from && from.domain) || "?"}${dmarcPolicy ? `, policy/action: ${dmarcPolicy}` : ""}.` +
+      (c === "bad" ? " The visible sender domain was not authenticated — a strong sign of spoofing." : "") + (authTrusted || c !== "good" ? "" : UNVERIFIED), c === "bad" ? 35 : c === "warn" ? 10 : 0);
     const hf = domainFrom(dmarc.props["header.from"] || "");
     if (hf && from && from.domain && !aligned(hf, from.domain)) add("bad", "DMARC result is for a different domain than From", `The DMARC result applies to ${hf}, but the From header shows ${from.domain}. The From header may be ambiguous or crafted to mislead.`, 30);
     if (dmarc.result === "pass" && dmarcPolicy === "none") add("info", "DMARC policy is p=none", "The sender’s domain only monitors failures and does not ask receivers to reject spoofed mail.");
@@ -722,11 +731,11 @@ function analyse(raw) {
 
   // ARC
   const arc = auth.arc && auth.arc[0];
-  if (arc) add(vouch(resClass(arc.result), topAR), `ARC ${arc.result}${topAR || arc.result !== "pass" ? "" : " — unverified"}`, `Authenticated Received Chain with ${arcSeals.length} seal(s). ARC preserves authentication results across forwarders and mailing lists.`, arc.result === "fail" ? 8 : 0);
+  if (arc) add(vouch(resClass(arc.result), authTrusted), `ARC ${arc.result}${authTrusted || arc.result !== "pass" ? "" : " — unverified"}`, `Authenticated Received Chain with ${arcSeals.length} seal(s). ARC preserves authentication results across forwarders and mailing lists.`, arc.result === "fail" ? 8 : 0);
 
   // Microsoft composite auth
   const comp = auth.compauth && auth.compauth[0];
-  if (comp) add(vouch(resClass(comp.result), topAR), `Microsoft compauth ${comp.result}${topAR || comp.result !== "pass" ? "" : " — unverified"}`, `Composite authentication reason code ${comp.props.reason || "?"}.` + (comp.result === "fail" ? " Microsoft considers the sender unauthenticated." : ""), comp.result === "fail" ? 15 : 0);
+  if (comp) add(vouch(resClass(comp.result), authTrusted), `Microsoft compauth ${comp.result}${authTrusted || comp.result !== "pass" ? "" : " — unverified"}`, `Composite authentication reason code ${comp.props.reason || "?"}.` + (comp.result === "fail" ? " Microsoft considers the sender unauthenticated." : ""), comp.result === "fail" ? 15 : 0);
 
   // Alignment
   if (from && from.domain) {
@@ -735,7 +744,7 @@ function analyse(raw) {
       else add("info", "SPF domain not aligned with From", `Envelope sender ${spfDomain} differs from From domain ${from.domain}. Common for mailing services; DMARC then relies on DKIM.`);
     }
     if (dkimPassDomains.length) {
-      if (dkimPassDomains.some((d) => aligned(d, from.domain))) add(vouch("good", topAR), "DKIM domain aligned with From", `A valid signature from ${dkimPassDomains.find((d) => aligned(d, from.domain))} matches From domain ${from.domain}.`);
+      if (dkimPassDomains.some((d) => aligned(d, from.domain))) add(vouch("good", authTrusted), "DKIM domain aligned with From", `A valid signature from ${dkimPassDomains.find((d) => aligned(d, from.domain))} matches From domain ${from.domain}.`);
       else add("warn", "DKIM domain not aligned with From", `Valid signature(s) from ${dkimPassDomains.join(", ")} do not match From domain ${from.domain}.`);
     }
     if (/(^|\.)xn--/.test(from.domain)) add("warn", "Internationalised (punycode) From domain", `${from.domain} uses punycode, which can disguise look-alike characters.`);
@@ -743,17 +752,30 @@ function analyse(raw) {
   else add("bad", "Missing From header", "Every message must have a From header.");
   if (from && from.ambiguous) add("bad", "Ambiguous From header", `The From header contains more than one address-like part (“${from.raw}”). Mail clients may show a different address from the one that was authenticated (${from.email}).`, 30);
 
-  // Display-name spoofing
+  // Display-name spoofing: any "@domain" in the display name or a comment whose organisation differs from From.
+  // Linear scan: each "@" reads forward only up to the next delimiter (which includes "@").
+  const otherDomain = (t) => {
+    if (!t || !from.domain) return "";
+    for (let at = t.indexOf("@"); at >= 0; at = t.indexOf("@", at + 1)) {
+      let e = at + 1;
+      while (e < t.length && !/[\s<>"'(),;:\[\]@\\]/.test(t[e])) e++;
+      let f = e; while (f > at + 1 && t[f - 1] === ".") f--;
+      const d = t.slice(at + 1, f).toLowerCase();
+      const tld = d.split(".").pop();
+      if (d.includes(".") && /^(?:[a-z]{2,}|xn--[a-z0-9-]+)$/.test(tld) && !aligned(d, from.domain)) return d;
+    }
+    return "";
+  };
   let hiddenAddr = false;
   if (from) {
-    const otherAddr = (t) => { const m = (t || "").match(/(?<![^\s<>"'@])[^\s<>"'@]+@([^\s<>"']+)/); return m && m[1].toLowerCase() !== from.domain ? m : null; };
-    const plain = otherAddr(from.rawName);
-    // An address that only appears after decoding encoded words, or only inside a comment, is deliberately hidden.
-    const hidden = !plain && (otherAddr(from.name) || from.comments.map(otherAddr).find(Boolean));
-    if (plain) add("bad", "Display name contains a different address", `The display name “${from.name}” shows ${plain[0]}, but the actual sender is ${from.email}.`, 30);
+    const plain = otherDomain(from.rawName);
+    // An address that only appears after decoding encoded words, after NFKC normalisation (full-width ＠ etc.),
+    // or only inside a comment, is deliberately hidden. Normalisation is for the check only, not for display.
+    const hidden = !plain && (otherDomain(from.name.normalize("NFKC")) || from.comments.map((c) => otherDomain(c.normalize("NFKC"))).find(Boolean));
+    if (plain) add("bad", "Display name contains a different address", `The display name “${from.name}” shows an address at ${plain}, but the actual sender is ${from.email}.`, 30);
     else if (hidden) {
       hiddenAddr = true;
-      add("bad", "Display name hides a different address", `After decoding encoded words or reading comments, the From header shows ${hidden[0]}, but the actual sender is ${from.email}. Hiding an address this way is a strong sign of spoofing.`, 35);
+      add("bad", "Display name hides a different address", `After decoding encoded words, normalising look-alike characters or reading comments, the From header shows an address at ${hidden}, but the actual sender is ${from.email}. Hiding an address this way is a strong sign of spoofing.`, 35);
     }
   }
 
@@ -831,9 +853,9 @@ function analyse(raw) {
   if (severe && level === "good") level = "warn";
   if (dmarc && dmarc.result === "fail") level = "bad";
   if (hiddenAddr || tooLong.includes("From")) level = "bad";
-  if (!topAR && level === "good") level = "warn"; // nothing verified by the receiving server
+  if (!authTrusted && level === "good") level = "warn"; // nothing verified by the receiving server
 
-  return { headers, from, replyTo, sender, returnPath, to, subject, dateHdr, msgId, auth, authSource, topAR, spfTrusted, arList, arBlock, arIgnored, arcList, arcUsable, dkimSigs, arcSeals, hops, checks, score, level, spf, spfDomain, spfIP, dmarc, dmarcPolicy, comp, arc, ff, mailer, origIP };
+  return { headers, from, replyTo, sender, returnPath, to, subject, dateHdr, msgId, auth, authSource, topAR, authTrusted, spfTrusted, arList, arBlock, arIgnored, arcList, arcUsable, dkimSigs, arcSeals, hops, checks, score, level, spf, spfDomain, spfIP, dmarc, dmarcPolicy, comp, arc, ff, mailer, origIP };
 }
 
 /* ---------- Rendering ---------- */
@@ -871,16 +893,18 @@ function render(a) {
   const dkBest = dk.find((r) => r.result === "pass") || dk[0];
   html += card("DKIM", dkBest ? dkBest.result : (a.dkimSigs.length ? "unverified" : "not signed"),
     (dk.length ? dk.map((r) => dkimDom(r) ? kv("Domain", `${dkimDom(r)} ${r.result}${r.props["header.s"] ? ` (s=${r.props["header.s"]})` : ""}`) : esc(r.comments[0] || ""))
-      : a.dkimSigs.map((s) => kv("Signed by", `${s.d} (s=${s.s}, ${s.a})`))).concat(dkBest && !a.topAR ? [UV] : []),
-    dkBest ? uvCls(a.topAR, dkBest.result) : "warn");
-  html += card("DMARC", a.dmarc ? a.dmarc.result : "not found", [kv("From domain", a.dmarc && a.dmarc.props["header.from"]), kv("Policy", a.dmarcPolicy), a.dmarc && !a.topAR ? UV : ""], a.dmarc ? uvCls(a.topAR, a.dmarc.result) : "warn");
-  if (a.arc || a.arcSeals.length) html += card("ARC", a.arc ? a.arc.result : "sealed", [kv("Seals", String(a.arcSeals.length)), kv("Chain", a.arcSeals.map((s) => s.cv).filter(Boolean).join(" → "))], a.arc ? uvCls(a.topAR, a.arc.result) : "neutral");
-  if (a.comp) html += card("CompAuth", a.comp.result, [kv("Reason", a.comp.props.reason), !a.topAR ? UV : ""], uvCls(a.topAR, a.comp.result));
+      : a.dkimSigs.map((s) => kv("Signed by", `${s.d} (s=${s.s}, ${s.a})`))).concat(dkBest && !a.authTrusted ? [UV] : []),
+    dkBest ? uvCls(a.authTrusted, dkBest.result) : "warn");
+  html += card("DMARC", a.dmarc ? a.dmarc.result : "not found", [kv("From domain", a.dmarc && a.dmarc.props["header.from"]), kv("Policy", a.dmarcPolicy), a.dmarc && !a.authTrusted ? UV : ""], a.dmarc ? uvCls(a.authTrusted, a.dmarc.result) : "warn");
+  if (a.arc || a.arcSeals.length) html += card("ARC", a.arc ? a.arc.result : "sealed", [kv("Seals", String(a.arcSeals.length)), kv("Chain", a.arcSeals.map((s) => s.cv).filter(Boolean).join(" → "))], a.arc ? uvCls(a.authTrusted, a.arc.result) : "neutral");
+  if (a.comp) html += card("CompAuth", a.comp.result, [kv("Reason", a.comp.props.reason), !a.authTrusted ? UV : ""], uvCls(a.authTrusted, a.comp.result));
   let src = `Source: ${esc(a.authSource)}`;
-  if (a.topAR) {
+  if (a.topAR && !a.authTrusted) src += " · <b>Unverified</b>: no receiving server hop found, so these results can’t be attributed to your mail provider";
+  else if (a.topAR) {
     if (a.arBlock[0].authserv) src += ` from <span class="mono">${esc(a.arBlock[0].authserv)}</span>`;
     if (a.arIgnored.length) src += ` · ${a.arIgnored.length} lower Authentication-Results header(s) ignored; only the topmost block (added by the final receiver) is used`;
   } else if (Object.keys(a.auth).length) src += " · <b>Unverified</b>: there is no top-level Authentication-Results header, so these results may have been supplied by the sender";
+  src += "<br>Results assume your receiving server added the topmost Authentication-Results header.";
   $("#authGrid").innerHTML = html + `<div class="d dim" style="grid-column:1/-1;font-size:12.5px">${src}</div>`;
 
   // Summary

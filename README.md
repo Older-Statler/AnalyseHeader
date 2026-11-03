@@ -28,9 +28,10 @@ The tool reads at most 1 MB of input and 64 KB per header value. If anything is 
   - a display name that hides a different address
   - a From header that is too long to parse
 
-  If there is no top-level `Authentication-Results` header, the best possible rating is "Some concerns".
+  The best possible rating is "Some concerns" if there is no top-level `Authentication-Results` header, or no `Received` or `X-Received` header.
 - **Authentication cards.** SPF, DKIM, DMARC and, when present, ARC and Microsoft CompAuth.
-  - **Top-level results.** Results come only from the trusted `Authentication-Results` block, which the final receiving server adds. The block is the first `Authentication-Results` header plus any others with the same authserv-id that sit above the topmost `Received` header. If there are no `Received` headers, only the first `Authentication-Results` header is used.
+  - **Top-level results.** Results come only from the trusted `Authentication-Results` block, which the final receiving server adds. The block is the first `Authentication-Results` header plus any others with the same authserv-id that sit above the topmost server hop. A server hop is a `Received` or `X-Received` header. The panel notes that the results assume your receiving server added the topmost `Authentication-Results` header.
+  - **No server hop, no trust.** If there is no `Received` or `X-Received` header at all, the results can't be attributed to your mail provider. Only the first `Authentication-Results` header is used, and its results are shown as "Unverified — may be sender-supplied".
   - **Other headers are ignored.** No other `Authentication-Results` headers are mixed in. If one reuses the receiver's ID, you get a "Possible forged Authentication-Results" warning. If it comes from another server, you get an info note.
   - **Earlier failures are reported.** A fail, softfail, hardfail or permerror in an ignored `Authentication-Results` header or in any ARC instance appears as an "An earlier server recorded … fail" warning. A sender has no reason to forge a failure. Passes from these sources are never trusted.
   - **Fallbacks are unverified.** If there's no `Authentication-Results` header, the tool uses the highest-instance `ARC-Authentication-Results` that has a matching `ARC-Seal` with a `cv` other than `fail`. If there's still no SPF result, it uses `Received-SPF`. These fallback results are labelled "Unverified — may be sender-supplied" and don't count as passes.
@@ -38,7 +39,12 @@ The tool reads at most 1 MB of input and 64 KB per header value. If anything is 
 - **Security checks.** Each check is marked Fail, Warn, Pass or Info, and you can filter the list by category. The checks cover:
   - SPF and DKIM domain alignment with the From domain
   - a DMARC result that applies to a different domain than From
-  - display-name spoofing: a display name that contains a different email address, or that hides one inside an encoded word or a comment
+  - display-name spoofing: an `@domain` in the display name whose organisational domain differs from the From domain, whatever the part before the `@` looks like.
+    - It catches quoted addresses such as `"john smith"@example.com`.
+    - The domain must contain a dot and end in a letter TLD, so social handles such as `@anadev` aren't flagged.
+    - Subdomains of the From domain aren't flagged.
+    - The check runs on Unicode-normalised (NFKC) text, so full-width look-alikes such as `＜service＠paypal.com＞` are caught. The name is still displayed as written.
+    - An address that only appears after decoding an encoded word, after normalisation, or inside a comment counts as hidden.
   - ambiguous From headers: more than one `<`, unbalanced quotes or comments, or an `@` outside the address
   - a Reply-To address that differs from From
   - punycode (`xn--`) From domains
@@ -82,6 +88,7 @@ You can paste the full message source instead of just the headers. Parsing stops
 
 - **Nothing is cryptographically verified.** The tool doesn't check DKIM signatures or ARC seals, look up DNS (SPF, DKIM or DMARC records), or check IP reputation. It reports what the receiving server recorded.
 - **Headers the sender could add are shown but not trusted.** Headers such as ignored `Authentication-Results`, `ARC-Authentication-Results`, `Received-SPF` and spam-filter verdicts can be written by the sender. The tool displays them, and reports any failures they record, but never treats them as evidence that a message is safe. It does trust the topmost `Authentication-Results` block, so its results are only as reliable as the headers you paste. Copy them straight from your own mail client.
+- **Look-alike detection is partial.** NFKC normalisation folds full-width and similar compatibility characters, but not every look-alike. For example, Cyrillic or Greek letters that resemble Latin ones (homoglyphs) are not detected.
 - **Alignment is approximate.** To check alignment, the tool works out each domain's "organisational domain" (for example, `example.co.uk` for `mail.example.co.uk`). It uses a simple built-in rule for this, not the Public Suffix List, so some domains will be grouped incorrectly.
 - **Partial headers give partial results.** If the pasted headers are incomplete, many results will show as "not found".
 - **Heuristic checks.** TLS detection, internal/external hop classification and `Received` parsing rely on pattern matching. Unusual server formats may be misread.
