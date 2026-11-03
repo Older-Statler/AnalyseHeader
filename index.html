@@ -5,7 +5,7 @@
 <!-- CSP: the script-src hash must be regenerated whenever the inline script changes. From this folder run:
      node -e 'const h=require("fs").readFileSync("index.html","utf8"),t="script>";console.log("sha256-"+require("crypto").createHash("sha256").update(h.slice(h.lastIndexOf("<"+t)+t.length+1,h.lastIndexOf("</"+t))).digest("base64"))' -->
 <!-- If this page is ever hosted, also send CSP "frame-ancestors 'none'" as an HTTP header: a meta CSP cannot set it. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-WZWahV7ePFIRWOMB9jbXrBJldNdQRoJWcq6nRb4bdwI='; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-7lM2jTLzfqQKDiP+QjBe1B9v/nz2/Q7TTzPxIW83k2A='; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Email Header Analyser</title>
 <meta name="description" content="Paste raw email headers to check SPF, DKIM, DMARC, spam verdicts and trace the mail flow. Runs entirely in your browser.">
@@ -762,16 +762,18 @@ function analyse(raw) {
       let f = e; while (f > at + 1 && t[f - 1] === ".") f--;
       const d = t.slice(at + 1, f).toLowerCase();
       const tld = d.split(".").pop();
-      if (d.includes(".") && /^(?:[a-z]{2,}|xn--[a-z0-9-]+)$/.test(tld) && !aligned(d, from.domain)) return d;
+      if (d.includes(".") && /^(?:\p{L}{2,}|xn--[\p{L}\p{N}-]+)$/u.test(tld) && !aligned(d, from.domain)) return d;
     }
     return "";
   };
+  // For the check only: NFKC, drop invisible characters (zero-width space, soft hyphen, …) and map dot look-alikes.
+  const unmask = (t) => t.normalize("NFKC").replace(/\p{Default_Ignorable_Code_Point}/gu, "").replace(/[\u3002\uFF61\uFF0E\u0701]/g, ".");
   let hiddenAddr = false;
   if (from) {
     const plain = otherDomain(from.rawName);
-    // An address that only appears after decoding encoded words, after NFKC normalisation (full-width ＠ etc.),
-    // or only inside a comment, is deliberately hidden. Normalisation is for the check only, not for display.
-    const hidden = !plain && (otherDomain(from.name.normalize("NFKC")) || from.comments.map((c) => otherDomain(c.normalize("NFKC"))).find(Boolean));
+    // An address that only appears after decoding encoded words, after unmasking look-alike / invisible characters,
+    // or only inside a comment, is deliberately hidden. Unmasking is for the check only, not for display.
+    const hidden = !plain && (otherDomain(unmask(from.name)) || from.comments.map((c) => otherDomain(unmask(c))).find(Boolean));
     if (plain) add("bad", "Display name contains a different address", `The display name “${from.name}” shows an address at ${plain}, but the actual sender is ${from.email}.`, 30);
     else if (hidden) {
       hiddenAddr = true;
@@ -849,13 +851,16 @@ function analyse(raw) {
   let score = 100 - checks.reduce((a, c) => a + (c.sev === "bad" || c.sev === "warn" ? c.weight : 0), 0);
   score = Math.max(0, Math.min(100, score));
   const severe = checks.some((c) => c.sev === "bad" && /DMARC|Display name|category|compauth|From header/i.test(c.title));
-  let level = score >= 80 ? "good" : score >= 50 ? "warn" : "bad";
-  if (severe && level === "good") level = "warn";
-  if (dmarc && dmarc.result === "fail") level = "bad";
-  if (hiddenAddr || tooLong.includes("From")) level = "bad";
-  if (!authTrusted && level === "good") level = "warn"; // nothing verified by the receiving server
+  let level = score >= 80 ? "good" : score >= 50 ? "warn" : "bad", scoreCap = "";
+  if (severe && level === "good") { level = "warn"; scoreCap = "a serious issue was found — see the failed checks."; }
+  if (dmarc && dmarc.result === "fail" && level !== "bad") { level = "bad"; scoreCap = "DMARC failed for the visible sender domain."; }
+  if ((hiddenAddr || tooLong.includes("From")) && level !== "bad") { level = "bad"; scoreCap = "the From header hides or obscures the real sender."; }
+  if (!authTrusted && level === "good") { level = "warn"; scoreCap = "authentication results could not be attributed to your mail provider."; }
+  // Keep the score consistent with a verdict that a rule forced below what the score implies.
+  const maxScore = level === "warn" ? 79 : level === "bad" ? 49 : 100;
+  if (score > maxScore) score = maxScore; else scoreCap = "";
 
-  return { headers, from, replyTo, sender, returnPath, to, subject, dateHdr, msgId, auth, authSource, topAR, authTrusted, spfTrusted, arList, arBlock, arIgnored, arcList, arcUsable, dkimSigs, arcSeals, hops, checks, score, level, spf, spfDomain, spfIP, dmarc, dmarcPolicy, comp, arc, ff, mailer, origIP };
+  return { headers, from, replyTo, sender, returnPath, to, subject, dateHdr, msgId, auth, authSource, topAR, authTrusted, spfTrusted, arList, arBlock, arIgnored, arcList, arcUsable, dkimSigs, arcSeals, hops, checks, score, level, scoreCap, spf, spfDomain, spfIP, dmarc, dmarcPolicy, comp, arc, ff, mailer, origIP };
 }
 
 /* ---------- Rendering ---------- */
@@ -877,7 +882,7 @@ function render(a) {
   const v = $("#verdict");
   v.className = "card verdict " + a.level;
   v.innerHTML = `<div class="score" aria-label="Score ${a.score} of 100">${a.score}</div>
-    <div><h2>${titles[a.level]}</h2><p>${desc[a.level]}</p>
+    <div><h2>${titles[a.level]}</h2><p>${desc[a.level]}</p>${a.scoreCap ? `<p style="margin-top:4px;font-size:13px">Score capped: ${esc(a.scoreCap)}</p>` : ""}
     <div class="counts">${counts.bad ? badge("bad", counts.bad + " failed") : ""}${counts.warn ? badge("warn", counts.warn + " warnings") : ""}${badge("good", counts.good + " passed")}${badge("info", counts.info + " info")}</div></div>`;
 
   // Auth cards

@@ -28,7 +28,11 @@ The tool reads at most 1 MB of input and 64 KB per header value. If anything is 
   - a display name that hides a different address
   - a From header that is too long to parse
 
-  The best possible rating is "Some concerns" if there is no top-level `Authentication-Results` header, or no `Received` or `X-Received` header.
+  These give at most "Some concerns":
+  - no trusted authentication results (no top-level `Authentication-Results` header, or no `Received` or `X-Received` header)
+  - a serious failed check, such as a DMARC, CompAuth, display-name or From-header failure, or a Microsoft threat category like phishing or spoofing
+
+  When one of these rules lowers the verdict, the score is lowered to match: at most 79 for "Some concerns" and at most 49 for "Suspicious". The verdict card then shows "Score capped:" followed by the reason.
 - **Authentication cards.** SPF, DKIM, DMARC and, when present, ARC and Microsoft CompAuth.
   - **Top-level results.** Results come only from the trusted `Authentication-Results` block, which the final receiving server adds. The block is the first `Authentication-Results` header plus any others with the same authserv-id that sit above the topmost server hop. A server hop is a `Received` or `X-Received` header. The panel notes that the results assume your receiving server added the topmost `Authentication-Results` header.
   - **No server hop, no trust.** If there is no `Received` or `X-Received` header at all, the results can't be attributed to your mail provider. Only the first `Authentication-Results` header is used, and its results are shown as "Unverified — may be sender-supplied".
@@ -41,10 +45,11 @@ The tool reads at most 1 MB of input and 64 KB per header value. If anything is 
   - a DMARC result that applies to a different domain than From
   - display-name spoofing: an `@domain` in the display name whose organisational domain differs from the From domain, whatever the part before the `@` looks like.
     - It catches quoted addresses such as `"john smith"@example.com`.
-    - The domain must contain a dot and end in a letter TLD, so social handles such as `@anadev` aren't flagged.
+    - The domain must contain a dot, and its ending can be letters in any script (for example `.рф`). Social handles such as `@anadev` aren't flagged.
     - Subdomains of the From domain aren't flagged.
-    - The check runs on Unicode-normalised (NFKC) text, so full-width look-alikes such as `＜service＠paypal.com＞` are caught. The name is still displayed as written.
-    - An address that only appears after decoding an encoded word, after normalisation, or inside a comment counts as hidden.
+    - Before checking, the text is cleaned up. It is Unicode-normalised (NFKC), so full-width look-alikes such as `＜service＠paypal.com＞` are caught. Invisible characters such as zero-width spaces and soft hyphens are removed. Dot look-alikes such as the ideographic full stop `。` are treated as dots. The name is still displayed as written.
+    - Look-alikes that are visible in the name as written, such as a Cyrillic letter, give "Display name contains a different address".
+    - An address that only appears after decoding an encoded word, after cleanup, or inside a comment counts as hidden. This gives "Display name hides a different address" and forces "Suspicious".
   - ambiguous From headers: more than one `<`, unbalanced quotes or comments, or an `@` outside the address
   - a Reply-To address that differs from From
   - punycode (`xn--`) From domains
@@ -88,7 +93,10 @@ You can paste the full message source instead of just the headers. Parsing stops
 
 - **Nothing is cryptographically verified.** The tool doesn't check DKIM signatures or ARC seals, look up DNS (SPF, DKIM or DMARC records), or check IP reputation. It reports what the receiving server recorded.
 - **Headers the sender could add are shown but not trusted.** Headers such as ignored `Authentication-Results`, `ARC-Authentication-Results`, `Received-SPF` and spam-filter verdicts can be written by the sender. The tool displays them, and reports any failures they record, but never treats them as evidence that a message is safe. It does trust the topmost `Authentication-Results` block, so its results are only as reliable as the headers you paste. Copy them straight from your own mail client.
-- **Look-alike detection is partial.** NFKC normalisation folds full-width and similar compatibility characters, but not every look-alike. For example, Cyrillic or Greek letters that resemble Latin ones (homoglyphs) are not detected.
+- **Look-alike detection is partial.** The display-name cleanup handles full-width forms, invisible characters and dot look-alikes, but not every disguise. These aren't detected:
+  - circled letters (such as `Ⓐ`)
+  - spelled-out addresses (`service at paypal.com`)
+  - names that only add text after the real domain (`service@paypal.com.evil.com`, when the From domain is `evil.com`)
 - **Alignment is approximate.** To check alignment, the tool works out each domain's "organisational domain" (for example, `example.co.uk` for `mail.example.co.uk`). It uses a simple built-in rule for this, not the Public Suffix List, so some domains will be grouped incorrectly.
 - **Partial headers give partial results.** If the pasted headers are incomplete, many results will show as "not found".
 - **Heuristic checks.** TLS detection, internal/external hop classification and `Received` parsing rely on pattern matching. Unusual server formats may be misread.
