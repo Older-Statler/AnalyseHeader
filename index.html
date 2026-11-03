@@ -5,7 +5,7 @@
 <!-- CSP: the script-src hash must be regenerated whenever the inline script changes. From this folder run:
      node -e 'const h=require("fs").readFileSync("index.html","utf8"),t="script>";console.log("sha256-"+require("crypto").createHash("sha256").update(h.slice(h.lastIndexOf("<"+t)+t.length+1,h.lastIndexOf("</"+t))).digest("base64"))' -->
 <!-- If this page is ever hosted, also send CSP "frame-ancestors 'none'" as an HTTP header: a meta CSP cannot set it. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-7lM2jTLzfqQKDiP+QjBe1B9v/nz2/Q7TTzPxIW83k2A='; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Q5Z47w+nXgDGk+S3CxkrBO91wSSYO03Qk6fimKZR0Wc='; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Email Header Analyser</title>
 <meta name="description" content="Paste raw email headers to check SPF, DKIM, DMARC, spam verdicts and trace the mail flow. Runs entirely in your browser.">
@@ -193,6 +193,8 @@
   th { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; border-top: 0; }
   td.hn { width: 30%; font: 600 12.5px/1.4 var(--mono); overflow-wrap: anywhere; }
   td.hv { font: 12.5px/1.4 var(--mono); overflow-wrap: anywhere; word-break: break-word; }
+  /* Untrusted header text must not reorder the page around it (RTL text, bidi controls). */
+  dd, td.hn, td.hv, .host, .checks .t, .checks .x, .badge, .route .node, .auth .v, .auth .d, .auth .d b, .mono, details.raw pre, .hop-head .time, .hop-meta .dim { unicode-bidi: isolate; }
   tr.sec td.hn { color: var(--accent); }
   .theme-btn { padding: 6px 10px; }
   footer { color: var(--muted); font-size: 12.5px; text-align: center; margin-top: 24px; }
@@ -277,7 +279,9 @@
 
 /* ---------- Helpers ---------- */
 const $ = (s) => document.querySelector(s);
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// Bidi embedding/override/isolate controls are shown as visible markers so they can't silently reorder text.
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]))
+  .replace(/[\u202A-\u202E\u2066-\u2069]/g, (c) => `[U+${c.charCodeAt(0).toString(16).toUpperCase()}]`);
 const badge = (cls, text) => `<span class="badge ${cls}">${esc(text)}</span>`;
 
 function fmtDur(ms) {
@@ -299,14 +303,16 @@ function fmtDate(d) {
 }
 
 /* ---------- Header parsing ---------- */
-const HEADER_LINE = /^([A-Za-z0-9!#$%&'*+.^_`|~-]+):[ \t]*(.*)$/;
+// [\s\S] rather than "." so U+2028/U+2029 inside a value can't make the line fail to parse and merge into the previous header.
+const HEADER_LINE = /^([A-Za-z0-9!#$%&'*+.^_`|~-]+):[ \t]*([\s\S]*)$/;
 
 function parseHeaders(raw) {
   const lines = raw.replace(/\r\n?/g, "\n").split("\n");
   const out = [];
   for (const line of lines) {
     // The first blank line after the headers ends the header block; anything below is body content.
-    if (line.trim() === "") { if (out.length) break; continue; }
+    // Only spaces/tabs count as blank: trim() would also treat a lone U+2028/U+2029 as blank and end the headers early.
+    if (/^[ \t]*$/.test(line)) { if (out.length) break; continue; }
     if (/^[ \t]/.test(line) && out.length) { out[out.length - 1].value += " " + line.trim(); continue; }
     const m = line.match(HEADER_LINE);
     if (m) out.push({ name: m[1], value: m[2].trim() });
@@ -356,6 +362,20 @@ function stripComments(v) {
 }
 
 const countAt = (s) => s.split("@").length - 1;
+
+// True when a domain label mixes letters from different scripts (e.g. Latin "p" + Cyrillic "а").
+// Digits, hyphens and combining marks are ignored; Han/Kana/Hangul count as one group.
+const SCRIPTS = [["Latin"], ["Cyrillic"], ["Greek"], ["Armenian"], ["Hebrew"], ["Arabic"], ["Georgian"], ["Thai"], ["Devanagari"],
+  ["Han", "CJK"], ["Hiragana", "CJK"], ["Katakana", "CJK"], ["Hangul", "CJK"]].map(([n, g]) => [new RegExp(`\\p{Script=${n}}`, "u"), g || n]);
+function mixedScript(label) {
+  let first = "";
+  for (const ch of label) {
+    if (!/\p{L}/u.test(ch)) continue;
+    const sc = (SCRIPTS.find(([re]) => re.test(ch)) || [0, "Other"])[1];
+    if (!first) first = sc; else if (sc !== first) return true;
+  }
+  return false;
+}
 
 function parseAddr(v) {
   if (!v) return null;
@@ -752,33 +772,56 @@ function analyse(raw) {
   else add("bad", "Missing From header", "Every message must have a From header.");
   if (from && from.ambiguous) add("bad", "Ambiguous From header", `The From header contains more than one address-like part (“${from.raw}”). Mail clients may show a different address from the one that was authenticated (${from.email}).`, 30);
 
-  // Display-name spoofing: any "@domain" in the display name or a comment whose organisation differs from From.
+  // Display-name spoofing: every "@domain" in the display name or a comment whose organisation differs from From.
   // Linear scan: each "@" reads forward only up to the next delimiter (which includes "@").
-  const otherDomain = (t) => {
-    if (!t || !from.domain) return "";
+  // Each hit records whether a local part precedes the "@" and whether any domain label mixes scripts.
+  const DELIM = /[\s<>"'(),;:\[\]@\\]/;
+  // Unusual spacing next to "@" (checked before cleanup, which removes it): any space separator other than U+0020,
+  // U+180E, U+2800 (braille blank), U+2028/U+2029 or a default-ignorable (zero-width space, …) directly before or after "@".
+  const ODD = /[\p{Zs}\u180E\u2800\u2028\u2029\p{Default_Ignorable_Code_Point}]/u;
+  const isOdd = (c) => c !== undefined && c !== " " && ODD.test(c);
+  const oddAt = (t, at) => isOdd(t[at - 1]) || isOdd(t[at + 1]);
+  const scanDomains = (t) => {
+    const hits = [];
+    if (!t || !from.domain) return hits;
     for (let at = t.indexOf("@"); at >= 0; at = t.indexOf("@", at + 1)) {
       let e = at + 1;
-      while (e < t.length && !/[\s<>"'(),;:\[\]@\\]/.test(t[e])) e++;
+      while (e < t.length && !DELIM.test(t[e])) e++;
       let f = e; while (f > at + 1 && t[f - 1] === ".") f--;
       const d = t.slice(at + 1, f).toLowerCase();
       const tld = d.split(".").pop();
-      if (d.includes(".") && /^(?:\p{L}{2,}|xn--[\p{L}\p{N}-]+)$/u.test(tld) && !aligned(d, from.domain)) return d;
+      if (d.includes(".") && /^(?:\p{L}{2,}|xn--[\p{L}\p{N}-]+)$/u.test(tld) && !aligned(d, from.domain))
+        hits.push({ d, odd: oddAt(t, at), mixed: d.split(".").some(mixedScript) });
     }
-    return "";
+    return hits;
   };
-  // For the check only: NFKC, drop invisible characters (zero-width space, soft hyphen, …) and map dot look-alikes.
-  const unmask = (t) => t.normalize("NFKC").replace(/\p{Default_Ignorable_Code_Point}/gu, "").replace(/[\u3002\uFF61\uFF0E\u0701]/g, ".");
+  // For the check only: delete unusual spaces (every space separator except U+0020, plus U+2800, U+180E, U+2028/U+2029)
+  // before NFKC would turn them into ordinary spaces, then NFKC, drop invisible characters and map dot look-alikes.
+  // So "service@<hair space>paypal.com" or "service@paypal<hair space>.com" reads as service@paypal.com here.
+  const unmask = (t) => t.replace(/(?! )[\p{Zs}\u2800\u180E\u2028\u2029]/gu, "").normalize("NFKC").replace(/\p{Default_Ignorable_Code_Point}/gu, "").replace(/[\u3002\uFF61\uFF0E\u0701]/g, ".");
   let hiddenAddr = false;
   if (from) {
-    const plain = otherDomain(from.rawName);
-    // An address that only appears after decoding encoded words, after unmasking look-alike / invisible characters,
-    // or only inside a comment, is deliberately hidden. Unmasking is for the check only, not for display.
-    const hidden = !plain && (otherDomain(unmask(from.name)) || from.comments.map((c) => otherDomain(unmask(c))).find(Boolean));
-    if (plain) add("bad", "Display name contains a different address", `The display name “${from.name}” shows an address at ${plain}, but the actual sender is ${from.email}.`, 30);
-    else if (hidden) {
+    // Bidi embedding/override/isolate controls (checked before unmask, which strips them) can make text display
+    // in a different order from how it is stored, e.g. "moc.lapyap@ecivres" shown as "service@paypal.com".
+    const BIDI = /[\u202A-\u202E\u2066-\u2069]/;
+    if (BIDI.test(from.raw) || BIDI.test(from.name) || from.comments.some((c) => BIDI.test(c))) {
       hiddenAddr = true;
-      add("bad", "Display name hides a different address", `After decoding encoded words, normalising look-alike characters or reading comments, the From header shows an address at ${hidden}, but the actual sender is ${from.email}. Hiding an address this way is a strong sign of spoofing.`, 35);
+      add("bad", "Display name uses text-direction controls", "The From header contains invisible text-direction control characters (shown as [U+…] markers), which can make the displayed name read differently from the actual text. This has no legitimate use in a sender name and is a strong sign of spoofing.", 35);
     }
+    const rawHits = scanDomains(from.rawName);
+    const rawSeen = new Set(rawHits.map((h) => h.d));
+    // Any "@domain" visible in the raw display name (with or without a local part) → "contains".
+    const plain = rawHits[0];
+    // Hidden: only after decoding encoded words, unmasking look-alikes / invisible characters, or inside a comment;
+    // or with unusual spacing next to "@" (checked on the decoded but not yet cleaned-up text);
+    // or with a domain label that mixes scripts (e.g. Latin + Cyrillic "pаypal").
+    const hidHits = scanDomains(unmask(from.name)).concat(...from.comments.map((c) => scanDomains(unmask(c)))).filter((h) => !rawSeen.has(h.d));
+    const oddHits = scanDomains(from.name).concat(...from.comments.map(scanDomains)).filter((h) => h.odd);
+    const hidden = hidHits[0] || oddHits[0] || rawHits.concat(hidHits).find((h) => h.odd || h.mixed);
+    if (hidden) {
+      hiddenAddr = true;
+      add("bad", "Display name hides a different address", `After decoding encoded words, normalising look-alike characters or reading comments, the From header shows an address at ${hidden.d}${hidden.mixed ? " (mixing look-alike letters from different alphabets)" : ""}, but the actual sender is ${from.email}. Hiding an address this way is a strong sign of spoofing.`, 35);
+    } else if (plain) add("bad", "Display name contains a different address", `The display name “${from.name}” shows an address at ${plain.d}, but the actual sender is ${from.email}.`, 30);
   }
 
   // Reply-To / Sender / Return-Path
@@ -916,7 +959,7 @@ function render(a) {
   const first = a.hops.find((h) => h.date), last = [...a.hops].reverse().find((h) => h.date);
   const start = a.dateHdr || (first && first.date);
   const total = start && last ? last.date - start : null;
-  const addr = (p) => p ? `${p.name ? esc(p.name) + " " : ""}<span class="mono">&lt;${esc(p.email)}&gt;</span>` : '<span class="dim">—</span>';
+  const addr = (p) => p ? `${p.name ? `<bdi>${esc(p.name)}</bdi> ` : ""}<span class="mono">&lt;${esc(p.email)}&gt;</span>` : '<span class="dim">—</span>';
   const rows = [
     ["From", addr(a.from)],
     a.sender ? ["Sender", addr(a.sender)] : null,
@@ -968,7 +1011,7 @@ function renderFlow(a) {
   // Timeline
   const maxDelay = Math.max(1, ...hops.map((h) => Math.abs(h.delay || 0)));
   let html = `<li class="endpoint"><div class="hop"><div class="hop-head"><span class="n">Message created</span>${a.mailer ? badge("neutral", a.mailer) : ""}<span class="time">${esc(fmtDate(a.dateHdr))}</span></div>
-    <div class="host">${a.from ? `${esc(a.from.name)} <span class="mono">&lt;${esc(a.from.email)}&gt;</span>` : '<span class="dim">Unknown sender</span>'}</div>
+    <div class="host">${a.from ? `<bdi>${esc(a.from.name)}</bdi> <span class="mono">&lt;${esc(a.from.email)}&gt;</span>` : '<span class="dim">Unknown sender</span>'}</div>
     ${a.origIP ? `<div class="hop-meta">${badge("info", "Client IP " + a.origIP.replace(/[\[\]]/g, ""))}</div>` : ""}</div></li>`;
 
   hops.forEach((h, i) => {

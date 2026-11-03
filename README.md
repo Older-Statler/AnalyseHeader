@@ -25,7 +25,7 @@ The tool reads at most 1 MB of input and 64 KB per header value. If anything is 
 
 - **Verdict and score.** An overall rating ("Looks legitimate", "Some concerns" or "Suspicious") and a score from 0 to 100. The score starts at 100 and loses points for each failed check or warning. These always give the "Suspicious" rating:
   - a DMARC failure
-  - a display name that hides a different address
+  - a display name that hides a different address, or that uses text-direction controls
   - a From header that is too long to parse
 
   These give at most "Some concerns":
@@ -43,14 +43,23 @@ The tool reads at most 1 MB of input and 64 KB per header value. If anything is 
 - **Security checks.** Each check is marked Fail, Warn, Pass or Info, and you can filter the list by category. The checks cover:
   - SPF and DKIM domain alignment with the From domain
   - a DMARC result that applies to a different domain than From
-  - display-name spoofing: an `@domain` in the display name whose organisational domain differs from the From domain, whatever the part before the `@` looks like.
-    - It catches quoted addresses such as `"john smith"@example.com`.
-    - The domain must contain a dot, and its ending can be letters in any script (for example `.рф`). Social handles such as `@anadev` aren't flagged.
-    - Subdomains of the From domain aren't flagged.
-    - Before checking, the text is cleaned up. It is Unicode-normalised (NFKC), so full-width look-alikes such as `＜service＠paypal.com＞` are caught. Invisible characters such as zero-width spaces and soft hyphens are removed. Dot look-alikes such as the ideographic full stop `。` are treated as dots. The name is still displayed as written.
-    - Look-alikes that are visible in the name as written, such as a Cyrillic letter, give "Display name contains a different address".
-    - An address that only appears after decoding an encoded word, after cleanup, or inside a comment counts as hidden. This gives "Display name hides a different address" and forces "Suspicious".
-  - ambiguous From headers: more than one `<`, unbalanced quotes or comments, or an `@` outside the address
+  - display-name spoofing: an address in the display name whose organisational domain differs from the From domain.
+    - **What counts as an address.** The domain must contain a dot, and its ending can be letters in any script (for example `.рф`). Subdomains of the From domain aren't flagged.
+    - **Contains.** Any `@domain` visible in the name as written gives "Display name contains a different address", whether or not there is a part before the `@`. That includes quoted addresses such as `"john smith"@example.com`. A social handle in a display name, such as `Ana @ana.dev`, may therefore cause a "Some concerns" warning. Phrases such as `Meet @ 10.30am` aren't flagged, because there's no domain ending made of letters.
+    - **Cleanup.** Before checking, the text is cleaned up:
+      - It is Unicode-normalised (NFKC), so full-width look-alikes such as `＜service＠paypal.com＞` are caught.
+      - Invisible characters such as zero-width spaces and soft hyphens are removed.
+      - Dot look-alikes such as the ideographic full stop `。` are treated as dots.
+
+      The name is still displayed as written.
+    - **Hides.** These give "Display name hides a different address" and force "Suspicious":
+      - an address that only appears after decoding an encoded word, after cleanup, or inside a comment (no part before the `@` needed)
+      - a domain label that mixes alphabets, such as Latin with a Cyrillic letter in `pаypal`
+      - an unusual space (non-breaking, thin, hair space and so on) or an invisible character directly before or after an `@`, or inside the domain
+
+      Domains in a single script, such as `.рф` or `müller.de`, are fine.
+  - text-direction controls in the From header: right-to-left override, embedding and isolate characters (U+202A–U+202E, U+2066–U+2069). These can make a reversed address look genuine, so they give "Display name uses text-direction controls" and force "Suspicious". Plain direction marks (LRM, RLM, ALM) are allowed, so normal Arabic and Hebrew names are unaffected.
+  - ambiguous From headers: more than one `<`, unbalanced quotes or comments, or an `@` outside the address and display name (for example in a comment)
   - a Reply-To address that differs from From
   - punycode (`xn--`) From domains
   - DKIM signatures that use SHA-1 or have expired
@@ -69,11 +78,12 @@ The tool reads at most 1 MB of input and 64 KB per header value. If anything is 
   - the delay since the previous hop
   - the raw `Received` header
 - **All headers.** A searchable table of every header. Security-relevant headers are highlighted, and encoded values are shown both decoded and raw.
+- **Safe display of header text.** Everywhere the page shows header text, text-direction control characters appear as visible markers such as `[U+202E]`. Untrusted text is displayed in isolation, so it can't reorder the rest of the page.
 - **Light/dark theme.** It follows your system setting by default. The toggle button overrides it, and your choice (`light` or `dark`) is saved in the browser's `localStorage`.
 
 ## Privacy
 
-All parsing and analysis happen inside the page, in JavaScript. A Content-Security-Policy in `index.html` (`default-src 'none'`) stops the page from making network connections or loading external resources. The only script allowed to run is the page's own inline script, which is identified by its hash. So even if a bug existed, the page could not send your headers anywhere.
+All parsing and analysis happen inside the page, in JavaScript. A Content-Security-Policy in `index.html` (`default-src 'none'`) stops the page from making network requests or loading external resources. The only script allowed to run is the page's own inline script, which is identified by its hash. The CSP doesn't block navigation, such as following a link. All header text is escaped before it is displayed. Text-direction controls appear as visible `[U+…]` markers, so a crafted header can't reorder what you see.
 
 The only outbound links are the optional **reputation** links next to public IP addresses in the mail-flow timeline. They point to [AbuseIPDB](https://www.abuseipdb.com/) and open in a new tab only when you click them. Clicking one sends that IP address to AbuseIPDB.
 
@@ -87,13 +97,14 @@ Email clients change their menus often, so these steps may not match your versio
 - **Apple Mail:** choose **View > Message > All Headers** or **View > Message > Raw Source**.
 - **Thunderbird:** choose **View > Message Source** (Ctrl+U / Cmd+U).
 
-You can paste the full message source instead of just the headers. Parsing stops at the first blank line, where the body begins.
+You can paste the full message source instead of just the headers. Parsing stops at the first blank line, where the body begins. Only ordinary line breaks split headers. A header line that contains a Unicode line or paragraph separator (U+2028, U+2029) is kept whole.
 
 ## Limitations
 
 - **Nothing is cryptographically verified.** The tool doesn't check DKIM signatures or ARC seals, look up DNS (SPF, DKIM or DMARC records), or check IP reputation. It reports what the receiving server recorded.
 - **Headers the sender could add are shown but not trusted.** Headers such as ignored `Authentication-Results`, `ARC-Authentication-Results`, `Received-SPF` and spam-filter verdicts can be written by the sender. The tool displays them, and reports any failures they record, but never treats them as evidence that a message is safe. It does trust the topmost `Authentication-Results` block, so its results are only as reliable as the headers you paste. Copy them straight from your own mail client.
-- **Look-alike detection is partial.** The display-name cleanup handles full-width forms, invisible characters and dot look-alikes, but not every disguise. These aren't detected:
+- **Look-alike detection is partial.** The display-name cleanup handles full-width forms, invisible characters, common dot look-alikes, mixed alphabets and text-direction controls, but not every disguise. These aren't detected:
+  - some dot look-alikes, such as `·` and `∙`
   - circled letters (such as `Ⓐ`)
   - spelled-out addresses (`service at paypal.com`)
   - names that only add text after the real domain (`service@paypal.com.evil.com`, when the From domain is `evil.com`)
